@@ -54,3 +54,6 @@ htmlcov/
 # For SR
 secrets.yaml
 problems
+
+# API key
+.env
