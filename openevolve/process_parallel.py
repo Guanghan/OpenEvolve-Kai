@@ -182,6 +182,12 @@ def _run_iteration_worker(
             feature_dimensions=db_snapshot.get("feature_dimensions", []),
         )
 
+        # NEW: Inject reflections from improvements manager into prompt
+        # This ensures failure lessons and success patterns guide LLM generation
+        reflections = db_snapshot.get("reflections", "")
+        if reflections:
+            prompt["user"] = f"## Lessons from Previous Attempts\n{reflections}\n\n{prompt['user']}"
+
         iteration_start = time.time()
 
         # Generate code modification (sync wrapper for async)
@@ -283,12 +289,14 @@ class ProcessParallelController:
         database: ProgramDatabase,
         evolution_tracer=None,
         file_suffix: str = ".py",
+        improvements_manager=None,  # NEW: ImprovementsManager for deep integration
     ):
         self.config = config
         self.evaluation_file = evaluation_file
         self.database = database
         self.evolution_tracer = evolution_tracer
         self.file_suffix = file_suffix
+        self.improvements_manager = improvements_manager  # NEW
 
         self.executor: Optional[ProcessPoolExecutor] = None
         self.shutdown_event = mp.Event()
@@ -299,6 +307,8 @@ class ProcessParallelController:
         self.num_islands = config.database.num_islands
 
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
+        if improvements_manager:
+            logger.info("Improvements manager integrated for deep learning from iterations")
 
     def _serialize_config(self, config: Config) -> dict:
         """Serialize config object to a dictionary that can be pickled"""
@@ -485,6 +495,45 @@ class ProcessParallelController:
 
                 if result.error:
                     logger.warning(f"Iteration {completed_iteration} error: {result.error}")
+
+                    # NEW: Notify improvements manager of failed iteration
+                    if self.improvements_manager:
+                        # Get parent info from database snapshot if available
+                        parent_id = result.parent_id if hasattr(result, 'parent_id') else None
+                        parent_fitness = 0.0
+                        if parent_id:
+                            parent_program = self.database.get(parent_id)
+                            if parent_program and parent_program.metrics:
+                                parent_fitness = parent_program.metrics.get("combined_score", 0)
+
+                        # Try to extract error type from the error message
+                        error_type = "unknown"
+                        error_msg = str(result.error)
+                        if "SyntaxError" in error_msg:
+                            error_type = "syntax"
+                        elif "NameError" in error_msg or "name" in error_msg.lower() and "is not defined" in error_msg.lower():
+                            error_type = "undefined_variable"
+                        elif "IndentationError" in error_msg:
+                            error_type = "indentation"
+                        elif "TypeError" in error_msg:
+                            error_type = "type"
+                        elif "IndexError" in error_msg:
+                            error_type = "index"
+                        elif "timeout" in error_msg.lower():
+                            error_type = "timeout"
+
+                        self.improvements_manager.on_iteration_end(
+                            iteration=completed_iteration,
+                            parent_id=parent_id,
+                            parent_fitness=parent_fitness,
+                            child_id=None,  # No child created for failures
+                            child_fitness=0.0,
+                            child_code=result.llm_response if hasattr(result, 'llm_response') else None,
+                            success=False,
+                            error_type=error_type,
+                            error_message=error_msg,
+                        )
+
                 elif result.child_program_dict:
                     # Reconstruct program from dict
                     child_program = Program(**result.child_program_dict)
@@ -590,6 +639,90 @@ class ProcessParallelController:
                             f"🌟 New best solution found at iteration {completed_iteration}: "
                             f"{child_program.id}"
                         )
+
+                    # NEW: Notify improvements manager of iteration result
+                    if self.improvements_manager:
+                        # Get parent program for metrics comparison
+                        parent_prog = self.database.get(result.parent_id) if result.parent_id else None
+
+                        # Check if this is actually a failure (evaluation returned exception)
+                        # Note: Artifacts may be in result.artifacts OR in child_program.metrics['artifacts']
+                        # depending on how the evaluator returns the result
+                        artifacts = result.artifacts or {}
+                        metrics_artifacts = child_program.metrics.get('artifacts', {}) if child_program.metrics else {}
+
+                        # Merge both sources of artifacts
+                        combined_artifacts = {**artifacts, **metrics_artifacts}
+
+                        is_evaluation_failure = (
+                            combined_artifacts.get('status') == 'EXCEPTION' or
+                            combined_artifacts.get('status') == 'VALIDATION_ERROR' or
+                            'exception' in combined_artifacts or
+                            'traceback' in combined_artifacts
+                        )
+
+                        # Initialize backtrack_target before the if/else block
+                        backtrack_target = None
+
+                        if is_evaluation_failure:
+                            # This is an evaluation failure - record as failure
+                            error_msg = combined_artifacts.get('exception', '') or combined_artifacts.get('validation_errors', '')
+                            error_type = "evaluation"
+                            if 'TypeError' in str(error_msg):
+                                error_type = "type"
+                            elif 'NameError' in str(error_msg) or 'is not defined' in str(error_msg):
+                                error_type = "undefined_variable"
+                            elif 'SyntaxError' in str(error_msg):
+                                error_type = "syntax"
+                            elif 'VALIDATION_ERROR' in str(combined_artifacts.get('status', '')):
+                                error_type = "validation"
+
+                            backtrack_target = self.improvements_manager.on_iteration_end(
+                                iteration=completed_iteration,
+                                parent_id=result.parent_id,
+                                parent_fitness=parent_prog.metrics.get("combined_score", 0) if parent_prog and parent_prog.metrics else 0,
+                                child_id=child_program.id,
+                                child_fitness=0.0,
+                                child_code=child_program.code,
+                                success=False,
+                                error_type=error_type,
+                                error_message=str(error_msg)[:500],  # Truncate long messages
+                            )
+                        else:
+                            # Calculate metrics improvement for successful iterations
+                            metrics_improvement = {}
+                            if parent_prog and parent_prog.metrics and child_program.metrics:
+                                for key, value in child_program.metrics.items():
+                                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                        parent_value = parent_prog.metrics.get(key, 0)
+                                        if isinstance(parent_value, (int, float)) and not isinstance(parent_value, bool):
+                                            metrics_improvement[key] = value - parent_value
+
+                            # Get feature coordinates if available
+                            feature_coords = None
+                            if "feature_coords" in child_program.metadata:
+                                feature_coords = tuple(child_program.metadata["feature_coords"])
+
+                            # Call on_iteration_end for success
+                            # V2: Pass artifacts for config extraction
+                            child_artifacts = child_program.metrics.get('artifacts', {}) if child_program.metrics else {}
+                            backtrack_target = self.improvements_manager.on_iteration_end(
+                                iteration=completed_iteration,
+                                parent_id=result.parent_id,
+                                parent_fitness=parent_prog.metrics.get("combined_score", 0) if parent_prog and parent_prog.metrics else 0,
+                                child_id=child_program.id,
+                                child_fitness=child_program.metrics.get("combined_score", 0),
+                                child_code=child_program.code,
+                                success=True,
+                                metrics_improvement=metrics_improvement,
+                                feature_coords=feature_coords,
+                                artifacts=child_artifacts,  # V2: Include artifacts
+                            )
+
+                        if backtrack_target:
+                            logger.info(f"💡 Soft backtrack suggested to: {backtrack_target}")
+                            # Note: Actual backtracking would require changing parent selection
+                            # For now, we just log it as a suggestion
 
                     # Checkpoint callback
                     # Don't checkpoint at iteration 0 (that's just the initial program)
@@ -725,6 +858,14 @@ class ProcessParallelController:
             # Create database snapshot
             db_snapshot = self._create_database_snapshot()
             db_snapshot["sampling_island"] = target_island  # Mark which island this is for
+
+            # NEW: Add reflections from improvements manager to snapshot
+            # This allows workers to inject failure lessons into prompts
+            if self.improvements_manager:
+                reflections = self.improvements_manager.format_reflections_for_prompt()
+                db_snapshot["reflections"] = reflections
+            else:
+                db_snapshot["reflections"] = ""
 
             # Submit to process pool
             future = self.executor.submit(

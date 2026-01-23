@@ -81,6 +81,16 @@ async def main_async() -> int:
     # Load base config from file or defaults
     config = load_config(args.config)
 
+    # NEW: Extract improvements config from raw YAML if present
+    improvements_config = None
+    if args.config:
+        import yaml
+        with open(args.config, 'r') as f:
+            raw_config = yaml.safe_load(f)
+        if raw_config and 'improvements' in raw_config:
+            improvements_config = raw_config['improvements']
+            print(f"Improvements config loaded (enabled={improvements_config.get('enabled', False)})")
+
     # Create config object with command-line overrides
     if args.api_base or args.primary_model or args.secondary_model:
         # Apply command-line overrides
@@ -110,6 +120,7 @@ async def main_async() -> int:
             evaluation_file=args.evaluation_file,
             config=config,
             output_dir=args.output,
+            improvements_config=improvements_config,  # NEW: Pass improvements config
         )
 
         # Load from checkpoint if specified

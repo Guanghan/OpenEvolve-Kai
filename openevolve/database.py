@@ -194,6 +194,40 @@ class ProgramDatabase:
         )
         self.similarity_threshold = config.similarity_threshold
 
+        # E-PUCT selector for intelligent parent selection (injected after init)
+        self.epuct_selector = None
+
+        # Lineage tracker for lineage-aware parent selection (injected after init)
+        self.lineage_tracker = None
+
+    def set_epuct_selector(self, epuct_selector) -> None:
+        """
+        Set the E-PUCT selector for intelligent parent selection.
+
+        This is called after initialization to inject the selector from ImprovementsManager.
+        When set, sample_from_island() will use E-PUCT scoring instead of random weighted selection.
+
+        Args:
+            epuct_selector: EPUCTSelector instance from improvements module
+        """
+        self.epuct_selector = epuct_selector
+        if epuct_selector:
+            logger.info("E-PUCT selector enabled for parent selection")
+
+    def set_lineage_tracker(self, lineage_tracker) -> None:
+        """
+        Set the Lineage Tracker for lineage-aware parent selection.
+
+        This is called after initialization to inject the tracker from ImprovementsManager.
+        When set, _sample_from_island_weighted() will multiply fitness by lineage_health.
+
+        Args:
+            lineage_tracker: LineageTracker instance from improvements module
+        """
+        self.lineage_tracker = lineage_tracker
+        if lineage_tracker:
+            logger.info("Lineage tracker enabled for parent selection (lineage_health weighting)")
+
     def add(
         self, program: Program, iteration: int = None, target_island: Optional[int] = None
     ) -> str:
@@ -428,8 +462,12 @@ class ProgramDatabase:
             # EXPLOITATION: Sample from archive (elite programs)
             parent = self._sample_from_archive_for_island(island_id)
             sampling_mode = "exploitation"
+        elif self.epuct_selector is not None:
+            # E-PUCT: Use PUCT-based intelligent selection (replaces weighted when available)
+            parent = self._sample_from_island_epuct(island_id)
+            sampling_mode = "epuct"
         else:
-            # WEIGHTED: Use fitness-weighted sampling (remaining probability)
+            # WEIGHTED: Use fitness-weighted sampling (fallback when no E-PUCT)
             parent = self._sample_from_island_weighted(island_id)
             sampling_mode = "weighted"
 
@@ -1410,7 +1448,13 @@ class ProgramDatabase:
 
     def _sample_from_island_weighted(self, island_id: int) -> Program:
         """
-        Sample a parent from a specific island using fitness-weighted selection
+        Sample a parent from a specific island using fitness-weighted selection.
+
+        When lineage_tracker is available, the weight is:
+            weight = fitness * (1 + productive_lineage_bonus * lineage_health)
+
+        This gives a bonus to programs from healthy lineages (high success rate,
+        good improvement rate, not deprioritized).
 
         Args:
             island_id: The island to sample from
@@ -1439,12 +1483,25 @@ class ProgramDatabase:
                 # Fallback if programs not found
                 parent_id = random.choice(island_programs)
             else:
-                # Calculate weights based on fitness scores
+                # Calculate weights based on fitness scores (and lineage health if available)
                 weights = []
                 for prog in island_program_objects:
                     fitness = get_fitness_score(prog.metrics, self.config.feature_dimensions)
                     # Add small epsilon to avoid zero weights
-                    weights.append(max(fitness, 0.001))
+                    base_weight = max(fitness, 0.001)
+
+                    # Apply lineage health bonus if lineage_tracker is available
+                    if self.lineage_tracker:
+                        lineage_health = self.lineage_tracker.get_lineage_health(prog.id)
+                        # productive_lineage_bonus default is 0.1
+                        bonus = self.lineage_tracker.config.productive_lineage_bonus
+                        # Weight multiplier: 1.0 to 1.0 + bonus (e.g., 1.0 to 1.1)
+                        # lineage_health is in [0, 1], so multiplier is in [1.0, 1.0 + bonus]
+                        weight = base_weight * (1.0 + bonus * lineage_health)
+                    else:
+                        weight = base_weight
+
+                    weights.append(weight)
 
                 # Normalize weights
                 total_weight = sum(weights)
@@ -1534,6 +1591,72 @@ class ProgramDatabase:
             # Fall back to any valid archive program if island has none
             parent_id = random.choice(valid_archive)
             return self.programs[parent_id]
+
+    def _sample_from_island_epuct(self, island_id: int) -> Program:
+        """
+        Sample a parent from a specific island using E-PUCT scoring.
+
+        E-PUCT (Evolution-PUCT) uses UCB-style scoring to balance:
+        - Fitness exploitation (selecting high-performing parents)
+        - Exploration bonus (giving underexplored parents a chance)
+        - Novelty bonus (preferring parents in less-explored feature regions)
+
+        Args:
+            island_id: The island to sample from
+
+        Returns:
+            Parent program selected via E-PUCT scoring
+        """
+        island_id = island_id % len(self.islands)
+        island_programs = list(self.islands[island_id])
+
+        if not island_programs:
+            logger.debug(f"Island {island_id} is empty, falling back to random sampling")
+            return self._sample_random_parent()
+
+        # Clean up stale references
+        valid_programs = [pid for pid in island_programs if pid in self.programs]
+
+        if not valid_programs:
+            logger.warning(
+                f"Island {island_id} has no valid programs, falling back to random sampling"
+            )
+            return self._sample_random_parent()
+
+        # Build candidates list for E-PUCT selector
+        candidates = []
+        for pid in valid_programs:
+            program = self.programs[pid]
+            # Get feature coordinates if available
+            feature_coords = None
+            if hasattr(program, 'metadata') and program.metadata:
+                coords = program.metadata.get('feature_coords')
+                if coords:
+                    feature_coords = tuple(coords) if isinstance(coords, list) else coords
+
+            candidates.append({
+                'id': pid,
+                'program': program,
+                'metrics': program.metrics,
+                'feature_coords': feature_coords,
+                'log_prob': program.metadata.get('log_prob') if hasattr(program, 'metadata') and program.metadata else None,
+            })
+
+        # Use E-PUCT selector to pick the best parent
+        selected = self.epuct_selector.select_parent(candidates, top_k=1)
+
+        if selected:
+            parent = selected[0].get('program')
+            if parent:
+                logger.debug(
+                    f"E-PUCT selected parent {parent.id} from island {island_id} "
+                    f"(score={parent.metrics.get('combined_score', 0):.4f})"
+                )
+                return parent
+
+        # Fallback to weighted sampling if E-PUCT fails
+        logger.warning("E-PUCT selection failed, falling back to weighted sampling")
+        return self._sample_from_island_weighted(island_id)
 
     def _sample_inspirations(self, parent: Program, n: int = 5) -> List[Program]:
         """

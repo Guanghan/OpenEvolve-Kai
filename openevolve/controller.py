@@ -21,6 +21,15 @@ from openevolve.prompt.sampler import PromptSampler
 from openevolve.utils.code_utils import extract_code_language
 from openevolve.utils.format_utils import format_improvement_safe, format_metrics_safe
 
+# Optional: Import improvements module (only if available)
+try:
+    from openevolve.improvements import ImprovementsManager, ImprovementsConfig
+    IMPROVEMENTS_AVAILABLE = True
+except ImportError:
+    IMPROVEMENTS_AVAILABLE = False
+    ImprovementsManager = None
+    ImprovementsConfig = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,9 +81,23 @@ class OpenEvolve:
         evaluation_file: str,
         config: Config,
         output_dir: Optional[str] = None,
+        improvements_config: Optional[dict] = None,  # NEW: Improvements configuration
     ):
         # Load configuration (loaded in main_async)
         self.config = config
+
+        # NEW: Initialize improvements manager if config provided and module available
+        self.improvements_manager = None
+        if improvements_config and IMPROVEMENTS_AVAILABLE:
+            try:
+                imp_config = ImprovementsConfig.from_dict(improvements_config)
+                if imp_config.enabled:
+                    self.improvements_manager = ImprovementsManager(imp_config)
+                    logger.info("Improvements manager initialized for deep integration")
+            except Exception as e:
+                logger.warning(f"Failed to initialize improvements manager: {e}")
+        elif improvements_config and not IMPROVEMENTS_AVAILABLE:
+            logger.warning("Improvements config provided but openevolve.improvements module not available")
 
         # Set up output directory
         self.output_dir = output_dir or os.path.join(
@@ -147,6 +170,14 @@ class OpenEvolve:
         self.config.database.novelty_llm = self.llm_ensemble
         self.database = ProgramDatabase(self.config.database)
 
+        # Inject E-PUCT selector into database if available
+        if self.improvements_manager and self.improvements_manager.epuct_selector:
+            self.database.set_epuct_selector(self.improvements_manager.epuct_selector)
+
+        # Inject Lineage tracker into database if available
+        if self.improvements_manager and self.improvements_manager.lineage_tracker:
+            self.database.set_lineage_tracker(self.improvements_manager.lineage_tracker)
+
         self.evaluator = Evaluator(
             self.config.evaluator,
             evaluation_file,
@@ -212,6 +243,30 @@ class OpenEvolve:
         """Load the initial program from file"""
         with open(self.initial_program_path, "r") as f:
             return f.read()
+
+    def _patch_prompt_sampler_with_improvements(self) -> None:
+        """Patch the prompt sampler to inject reflections from improvements manager"""
+        if not self.improvements_manager:
+            return
+
+        original_build_prompt = self.prompt_sampler.build_prompt
+
+        def build_prompt_with_reflections(*args, **kwargs):
+            # Get original prompt
+            prompt = original_build_prompt(*args, **kwargs)
+
+            # Get reflections from improvements manager
+            reflections = self.improvements_manager.format_reflections_for_prompt()
+
+            if reflections:
+                # Inject reflections into the user message
+                prompt["user"] = f"{reflections}\n\n{prompt['user']}"
+
+            return prompt
+
+        # Replace the method
+        self.prompt_sampler.build_prompt = build_prompt_with_reflections
+        logger.info("Patched prompt sampler to include reflections from improvements")
 
     async def run(
         self,
@@ -299,6 +354,7 @@ class OpenEvolve:
                 self.database,
                 self.evolution_tracer,
                 file_suffix=self.config.file_suffix,
+                improvements_manager=self.improvements_manager,  # NEW: Pass improvements manager
             )
 
             # Set up signal handlers for graceful shutdown
@@ -319,6 +375,11 @@ class OpenEvolve:
             signal.signal(signal.SIGTERM, signal_handler)
 
             self.parallel_controller.start()
+
+            # NEW: Patch prompt sampler if improvements manager is available
+            if self.improvements_manager:
+                self._patch_prompt_sampler_with_improvements()
+                logger.info("Prompt sampler patched with improvements integration")
 
             # When starting from iteration 0, we've already done the initial program evaluation
             # So we need to adjust the start_iteration for the actual evolution
@@ -346,6 +407,33 @@ class OpenEvolve:
             if self.evolution_tracer:
                 self.evolution_tracer.close()
                 logger.info("Evolution tracer closed")
+
+            # NEW: Save improvements data and log summary
+            if self.improvements_manager:
+                # Save to output directory
+                improvements_dir = os.path.join(self.output_dir, "improvements")
+                os.makedirs(improvements_dir, exist_ok=True)
+                self.improvements_manager.save(improvements_dir)
+
+                # Log summary using get_stats()
+                stats = self.improvements_manager.get_stats()
+                logger.info("=" * 50)
+                logger.info("IMPROVEMENTS SUMMARY")
+                logger.info("=" * 50)
+                if stats.get("reflection_memory"):
+                    rm = stats["reflection_memory"]
+                    logger.info(f"Reflection Memory: {rm.get('total_failures', 0)} failures, "
+                               f"{rm.get('total_patterns', 0)} patterns, "
+                               f"{rm.get('retrievals', 0)} retrievals")
+                if stats.get("epuct_selector"):
+                    ep = stats["epuct_selector"]
+                    logger.info(f"E-PUCT Selector: {ep.get('total_generations', 0)} generations, "
+                               f"{ep.get('total_selections', 0)} selections")
+                if stats.get("lineage_tracker"):
+                    lt = stats["lineage_tracker"]
+                    logger.info(f"Lineage Tracker: {lt.get('total_nodes', 0)} nodes, "
+                               f"{lt.get('total_backtracks', 0)} backtracks")
+                logger.info("=" * 50)
 
         # Get the best program
         best_program = None

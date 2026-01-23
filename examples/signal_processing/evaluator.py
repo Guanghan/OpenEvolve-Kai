@@ -276,7 +276,7 @@ def evaluate(program_path):
 
         # Check if required function exists
         if not hasattr(program, "run_signal_processing"):
-            return {"composite_score": 0.0, "error": "Missing run_signal_processing function"}
+            return {"composite_score": 0.0, "combined_score": 0.0, "error": "Missing run_signal_processing function"}
 
         # Generate test signals
         test_signals = generate_test_signals(5)
@@ -394,6 +394,7 @@ def evaluate(program_path):
         if successful_runs == 0:
             return {
                 "composite_score": 0.0,
+                "combined_score": 0.0,  # Alias for OpenEvolve compatibility
                 "slope_changes": 100.0,
                 "lag_error": 1.0,
                 "avg_error": 1.0,
@@ -433,6 +434,7 @@ def evaluate(program_path):
         return {
             "composite_score": safe_float(avg_composite_score),
             "overall_score": safe_float(overall_score),  # Primary selection metric
+            "combined_score": safe_float(overall_score),  # Alias for OpenEvolve compatibility
             "slope_changes": safe_float(avg_slope_changes),
             "lag_error": safe_float(avg_lag_error),
             "avg_error": safe_float(avg_avg_error),
@@ -450,7 +452,7 @@ def evaluate(program_path):
     except Exception as e:
         print(f"Evaluation failed: {str(e)}")
         print(traceback.format_exc())
-        return {"composite_score": 0.0, "overall_score": 0.0, "error": str(e)}
+        return {"composite_score": 0.0, "overall_score": 0.0, "combined_score": 0.0, "error": str(e)}
 
 
 def evaluate_stage1(program_path):

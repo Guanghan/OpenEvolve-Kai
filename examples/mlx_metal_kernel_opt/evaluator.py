@@ -191,6 +191,7 @@ class BulletproofMetalEvaluator:
             result = {
                 "success": True,
                 "final_score": final_score,
+                "combined_score": final_score,  # Alias for OpenEvolve compatibility
                 "performance_metrics": performance_analysis["aggregate_metrics"],
                 "correctness_score": correctness_score,
                 "benchmark_results": [self._result_to_dict(r) for r in custom_results],
@@ -1333,6 +1334,7 @@ class BulletproofMetalEvaluator:
         return {
             "success": False,
             "final_score": -1000.0,
+            "combined_score": -1000.0,  # Alias for OpenEvolve compatibility
             "error": error_message,
             "performance_metrics": {},
             "correctness_score": 0.0,
