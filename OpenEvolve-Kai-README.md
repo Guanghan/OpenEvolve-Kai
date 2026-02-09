@@ -1,7 +1,5 @@
-# OpenEvolve Improvement Detailed Documentation
+# OpenEvolve-Kai
 
-> **Author**: Guanghan Ning
-> **Date**: 2026-01-23 (Organized on 2026-02-08)
 > **Core Contribution**: Proposed and implemented the **REE (Reflection-Enhanced Evolution)** architecture, introducing three improvement modules on top of OpenEvolve
 
 ---
@@ -376,6 +374,8 @@ Reflection Memory answers: "What information to tell the LLM?"
 ---
 
 ## 6. Module 2: E-PUCT Selector (Evolution-PUCT Selector)
+
+> **Standalone Reference**: For a self-contained explanation with formula visualizations and concrete calculation examples, see **[E-PUCT.md](E-PUCT.md)**.
 
 ### 6.1 Motivation
 
@@ -1311,7 +1311,7 @@ c_puct: 1.5  # PUCT constant
 | File | Lines | Function |
 |------|-------|----------|
 | `openevolve/reflection_memory.py` | ~844 | Bidirectional Reflection Memory core module |
-| `openevolve/epuct_selector.py` | ~456 | E-PUCT Selector |
+| `openevolve/epuct_selector.py` | ~456 | E-PUCT Selector (see also [E-PUCT.md](E-PUCT.md) for detailed explanation) |
 | `openevolve/lineage_tracker.py` | ~480 | Lineage Tracker |
 | `openevolve/improvements.py` | ~457 | Unified Manager |
 | `openevolve/token_tracker.py` | ~200 | Token usage tracking |
