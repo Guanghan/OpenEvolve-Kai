@@ -18,6 +18,7 @@ from openevolve.evolution_trace import EvolutionTracer
 from openevolve.llm.ensemble import LLMEnsemble
 from openevolve.process_parallel import ProcessParallelController
 from openevolve.prompt.sampler import PromptSampler
+from openevolve.token_tracker import TokenTracker
 from openevolve.utils.code_utils import extract_code_language
 from openevolve.utils.format_utils import format_improvement_safe, format_metrics_safe
 
@@ -215,6 +216,10 @@ class OpenEvolve:
         # Initialize improved parallel processing components
         self.parallel_controller = None
 
+        # Initialize token tracker for resource usage monitoring
+        self.token_tracker = TokenTracker()
+        logger.info("Token tracker initialized for resource usage monitoring")
+
     def _setup_logging(self) -> None:
         """Set up logging"""
         log_dir = self.config.log_dir or os.path.join(self.output_dir, "logs")
@@ -355,6 +360,7 @@ class OpenEvolve:
                 self.evolution_tracer,
                 file_suffix=self.config.file_suffix,
                 improvements_manager=self.improvements_manager,  # NEW: Pass improvements manager
+                token_tracker=self.token_tracker,  # Token usage tracking
             )
 
             # Set up signal handlers for graceful shutdown
@@ -433,6 +439,20 @@ class OpenEvolve:
                     lt = stats["lineage_tracker"]
                     logger.info(f"Lineage Tracker: {lt.get('total_nodes', 0)} nodes, "
                                f"{lt.get('total_backtracks', 0)} backtracks")
+                logger.info("=" * 50)
+
+            # Save token usage statistics
+            if self.token_tracker:
+                self.token_tracker.save(self.output_dir)
+                token_stats = self.token_tracker.get_stats()
+                logger.info("=" * 50)
+                logger.info("TOKEN USAGE SUMMARY")
+                logger.info("=" * 50)
+                logger.info(f"Total iterations: {token_stats['total_iterations']}")
+                logger.info(f"Total tokens: {token_stats['cumulative_total_tokens']:,}")
+                logger.info(f"  - Prompt tokens: {token_stats['cumulative_prompt_tokens']:,}")
+                logger.info(f"  - Completion tokens: {token_stats['cumulative_completion_tokens']:,}")
+                logger.info(f"Avg tokens/iteration: {token_stats['avg_tokens_per_iteration']:.1f}")
                 logger.info("=" * 50)
 
         # Get the best program
@@ -547,6 +567,10 @@ class OpenEvolve:
                 f"{format_metrics_safe(best_program.metrics)}"
             )
 
+        # Save token statistics at checkpoint
+        if self.token_tracker:
+            self.token_tracker.save(checkpoint_path)
+
         logger.info(f"Saved checkpoint at iteration {iteration} to {checkpoint_path}")
 
     def _load_checkpoint(self, checkpoint_path: str) -> None:
@@ -556,6 +580,13 @@ class OpenEvolve:
 
         logger.info(f"Loading checkpoint from {checkpoint_path}")
         self.database.load(checkpoint_path)
+
+        # Load token statistics if available
+        token_stats_path = os.path.join(checkpoint_path, "token_stats.json")
+        if os.path.exists(token_stats_path) and self.token_tracker:
+            self.token_tracker.load(token_stats_path)
+            logger.info(f"Token statistics loaded from checkpoint")
+
         logger.info(f"Checkpoint loaded successfully (iteration {self.database.last_iteration})")
 
     async def _run_evolution_with_checkpoints(

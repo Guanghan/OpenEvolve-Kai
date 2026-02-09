@@ -29,6 +29,13 @@ class Result:
     prompt: str = None
     llm_response: str = None
     artifacts: dict = None
+    # Token usage tracking
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    model: str = ""
+    # Log probability for E-PUCT prior
+    log_prob: float = None
 
 
 async def run_iteration_with_shared_db(
@@ -76,11 +83,17 @@ async def run_iteration_with_shared_db(
         result = Result(parent=parent)
         iteration_start = time.time()
 
-        # Generate code modification
-        llm_response = await llm_ensemble.generate_with_context(
+        # Generate code modification with token tracking
+        llm_result = await llm_ensemble.generate_with_context_and_usage(
             system_message=prompt["system"],
             messages=[{"role": "user", "content": prompt["user"]}],
         )
+        llm_response = llm_result.content
+        result.prompt_tokens = llm_result.prompt_tokens
+        result.completion_tokens = llm_result.completion_tokens
+        result.total_tokens = llm_result.total_tokens
+        result.model = llm_result.model
+        result.log_prob = llm_result.log_prob
 
         # Parse the response
         if config.diff_based_evolution:
@@ -123,6 +136,14 @@ async def run_iteration_with_shared_db(
         template_key = "full_rewrite_user" if not config.diff_based_evolution else "diff_user"
 
         # Create a child program
+        # Include log_prob in metadata for E-PUCT prior computation
+        program_metadata = {
+            "changes": changes_summary,
+            "parent_metrics": parent.metrics,
+        }
+        if result.log_prob is not None:
+            program_metadata["log_prob"] = result.log_prob
+
         result.child_program = Program(
             id=child_id,
             code=child_code,
@@ -131,10 +152,7 @@ async def run_iteration_with_shared_db(
             generation=parent.generation + 1,
             metrics=result.child_metrics,
             iteration_found=iteration,
-            metadata={
-                "changes": changes_summary,
-                "parent_metrics": parent.metrics,
-            },
+            metadata=program_metadata,
             prompts=(
                 {
                     template_key: {

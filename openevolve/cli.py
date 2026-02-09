@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--secondary-model", help="Secondary LLM model name", default=None)
 
+    parser.add_argument(
+        "--seed", "-s", help="Random seed for reproducibility", type=int, default=None
+    )
+
     return parser.parse_args()
 
 
@@ -90,6 +94,11 @@ async def main_async() -> int:
         if raw_config and 'improvements' in raw_config:
             improvements_config = raw_config['improvements']
             print(f"Improvements config loaded (enabled={improvements_config.get('enabled', False)})")
+
+    # Apply seed override if specified
+    if args.seed is not None:
+        config.random_seed = args.seed
+        print(f"Using random seed: {args.seed}")
 
     # Create config object with command-line overrides
     if args.api_base or args.primary_model or args.secondary_model:

@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from openevolve.config import Config
 from openevolve.database import Program, ProgramDatabase
 from openevolve.utils.metrics_utils import safe_numeric_average
+from openevolve.token_tracker import TokenTracker, TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,11 @@ class SerializableResult:
     artifacts: Optional[Dict[str, Any]] = None
     iteration: int = 0
     error: Optional[str] = None
+    # Token usage tracking
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    model: str = ""
 
 
 def _worker_init(config_dict: dict, evaluation_file: str, parent_env: dict = None) -> None:
@@ -190,14 +196,26 @@ def _run_iteration_worker(
 
         iteration_start = time.time()
 
+        # Token usage tracking variables
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        model_name = ""
+
         # Generate code modification (sync wrapper for async)
+        # Use generate_with_context_and_usage to capture token usage
         try:
-            llm_response = asyncio.run(
-                _worker_llm_ensemble.generate_with_context(
+            llm_result = asyncio.run(
+                _worker_llm_ensemble.generate_with_context_and_usage(
                     system_message=prompt["system"],
                     messages=[{"role": "user", "content": prompt["user"]}],
                 )
             )
+            llm_response = llm_result.content
+            prompt_tokens = llm_result.prompt_tokens
+            completion_tokens = llm_result.completion_tokens
+            total_tokens = llm_result.total_tokens
+            model_name = llm_result.model
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
             return SerializableResult(error=f"LLM generation failed: {str(e)}", iteration=iteration)
@@ -272,6 +290,10 @@ def _run_iteration_worker(
             llm_response=llm_response,
             artifacts=artifacts,
             iteration=iteration,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            model=model_name,
         )
 
     except Exception as e:
@@ -290,6 +312,7 @@ class ProcessParallelController:
         evolution_tracer=None,
         file_suffix: str = ".py",
         improvements_manager=None,  # NEW: ImprovementsManager for deep integration
+        token_tracker: Optional[TokenTracker] = None,  # Token usage tracking
     ):
         self.config = config
         self.evaluation_file = evaluation_file
@@ -306,9 +329,13 @@ class ProcessParallelController:
         self.num_workers = config.evaluator.parallel_evaluations
         self.num_islands = config.database.num_islands
 
+        # Token usage tracking
+        self.token_tracker = token_tracker or TokenTracker()
+
         logger.info(f"Initialized process parallel controller with {self.num_workers} workers")
         if improvements_manager:
             logger.info("Improvements manager integrated for deep learning from iterations")
+        logger.info("Token usage tracking enabled")
 
     def _serialize_config(self, config: Config) -> dict:
         """Serialize config object to a dictionary that can be pickled"""
@@ -380,7 +407,14 @@ class ProcessParallelController:
         self.shutdown_event.set()
 
         if self.executor:
-            self.executor.shutdown(wait=True)
+            # Use cancel_futures=True (Python 3.9+) to immediately cancel pending work
+            # This prevents blocking indefinitely on pending futures
+            import sys
+            if sys.version_info >= (3, 9):
+                self.executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                # For older Python, shutdown without waiting to avoid blocking
+                self.executor.shutdown(wait=False)
             self.executor = None
 
         logger.info("Stopped process pool")
@@ -599,12 +633,34 @@ class ProcessParallelController:
                         self.database.migrate_programs()
                         self.database.log_island_status()
 
+                    # Record token usage
+                    if result.total_tokens > 0:
+                        token_usage = TokenUsage(
+                            prompt_tokens=result.prompt_tokens,
+                            completion_tokens=result.completion_tokens,
+                            total_tokens=result.total_tokens,
+                            model=result.model,
+                        )
+                        # Get best score for tracking
+                        best_program = self.database.get_best_program()
+                        best_score = (
+                            best_program.metrics.get("combined_score", 0)
+                            if best_program and best_program.metrics else 0
+                        )
+                        self.token_tracker.record_iteration(
+                            iteration=completed_iteration,
+                            token_usage=token_usage,
+                            best_score=best_score,
+                            timestamp=time.time(),
+                        )
+
                     # Log progress
                     logger.info(
                         f"Iteration {completed_iteration}: "
                         f"Program {child_program.id} "
                         f"(parent: {result.parent_id}) "
                         f"completed in {result.iteration_time:.2f}s"
+                        + (f" [tokens: {result.total_tokens}]" if result.total_tokens > 0 else "")
                     )
 
                     if child_program.metrics:
@@ -825,9 +881,13 @@ class ProcessParallelController:
                         next_iteration += 1
                         break  # Only submit one iteration per completion to maintain balance
 
-        # Handle shutdown
-        if self.shutdown_event.is_set():
-            logger.info("Shutdown requested, canceling remaining evaluations...")
+        # Cancel any remaining pending futures
+        # This is critical to prevent stop() from blocking indefinitely
+        if pending_futures:
+            if self.shutdown_event.is_set():
+                logger.info("Shutdown requested, canceling remaining evaluations...")
+            else:
+                logger.info(f"Canceling {len(pending_futures)} remaining pending futures...")
             for future in pending_futures.values():
                 future.cancel()
 

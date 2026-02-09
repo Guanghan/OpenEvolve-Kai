@@ -5,11 +5,14 @@ Model ensemble for LLMs
 import asyncio
 import logging
 import random
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from openevolve.llm.base import LLMInterface
-from openevolve.llm.openai import OpenAILLM
+from openevolve.llm.openai import OpenAILLM, LLMResponse
 from openevolve.config import LLMModelConfig
+
+if TYPE_CHECKING:
+    from openevolve.token_tracker import TokenUsage
 
 logger = logging.getLogger(__name__)
 
@@ -92,3 +95,25 @@ class LLMEnsemble:
         for model in self.models:
             responses.append(await model.generate_with_context(system_message, messages, **kwargs))
         return responses
+
+    async def generate_with_usage(self, prompt: str, **kwargs) -> LLMResponse:
+        """Generate text using a randomly selected model, returning token usage"""
+        model = self._sample_model()
+        if hasattr(model, 'generate_with_usage'):
+            return await model.generate_with_usage(prompt, **kwargs)
+        else:
+            # Fallback for models that don't support usage tracking
+            content = await model.generate(prompt, **kwargs)
+            return LLMResponse(content=content, model=getattr(model, 'model', ''))
+
+    async def generate_with_context_and_usage(
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs
+    ) -> LLMResponse:
+        """Generate text using a system message and conversational context, with token usage"""
+        model = self._sample_model()
+        if hasattr(model, 'generate_with_context_and_usage'):
+            return await model.generate_with_context_and_usage(system_message, messages, **kwargs)
+        else:
+            # Fallback for models that don't support usage tracking
+            content = await model.generate_with_context(system_message, messages, **kwargs)
+            return LLMResponse(content=content, model=getattr(model, 'model', ''))

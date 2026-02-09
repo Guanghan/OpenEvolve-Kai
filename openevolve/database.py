@@ -450,26 +450,30 @@ class ProgramDatabase:
             logger.debug(f"Island {island_id} is empty, sampling from all programs")
             return self.sample(num_inspirations)
 
-        # Use exploration_ratio and exploitation_ratio to decide sampling strategy
-        # This matches the logic in _sample_parent() for consistent behavior
-        rand_val = random.random()
-
-        if rand_val < self.config.exploration_ratio:
-            # EXPLORATION: Sample randomly from island (diverse sampling)
-            parent = self._sample_from_island_random(island_id)
-            sampling_mode = "exploration"
-        elif rand_val < self.config.exploration_ratio + self.config.exploitation_ratio:
-            # EXPLOITATION: Sample from archive (elite programs)
-            parent = self._sample_from_archive_for_island(island_id)
-            sampling_mode = "exploitation"
-        elif self.epuct_selector is not None:
-            # E-PUCT: Use PUCT-based intelligent selection (replaces weighted when available)
+        # E-PUCT COMPLETE REPLACEMENT:
+        # When E-PUCT is enabled, it completely replaces the original selection mechanism
+        # This ensures a fair ablation study - E-PUCT handles ALL parent selections
+        # E-PUCT internally balances exploration/exploitation via alpha/beta/gamma weights
+        if self.epuct_selector is not None:
+            # E-PUCT: Use PUCT-based intelligent selection for ALL parent selections
             parent = self._sample_from_island_epuct(island_id)
             sampling_mode = "epuct"
         else:
-            # WEIGHTED: Use fitness-weighted sampling (fallback when no E-PUCT)
-            parent = self._sample_from_island_weighted(island_id)
-            sampling_mode = "weighted"
+            # ORIGINAL MECHANISM: Use exploration/exploitation/weighted strategy
+            rand_val = random.random()
+
+            if rand_val < self.config.exploration_ratio:
+                # EXPLORATION: Sample randomly from island (diverse sampling)
+                parent = self._sample_from_island_random(island_id)
+                sampling_mode = "exploration"
+            elif rand_val < self.config.exploration_ratio + self.config.exploitation_ratio:
+                # EXPLOITATION: Sample from archive (elite programs)
+                parent = self._sample_from_archive_for_island(island_id)
+                sampling_mode = "exploitation"
+            else:
+                # WEIGHTED: Use fitness-weighted sampling
+                parent = self._sample_from_island_weighted(island_id)
+                sampling_mode = "weighted"
 
         # Select inspirations from the same island
         if num_inspirations is None:
@@ -1298,7 +1302,13 @@ class ProgramDatabase:
         Returns:
             Parent program from current island
         """
-        # Use exploration_ratio and exploitation_ratio to decide sampling strategy
+        # E-PUCT COMPLETE REPLACEMENT:
+        # When E-PUCT is enabled, it completely replaces the original selection mechanism
+        if self.epuct_selector is not None:
+            # E-PUCT: Use PUCT-based intelligent selection for ALL parent selections
+            return self._sample_from_island_epuct(self.current_island)
+
+        # ORIGINAL MECHANISM: Use exploration/exploitation/random strategy
         rand_val = random.random()
 
         if rand_val < self.config.exploration_ratio:

@@ -155,10 +155,12 @@ class EPUCTSelector:
             # Higher log prob = more "natural" mutation = higher prior
             prior = self._logprob_to_prior(log_prob)
             stats.log_prob_prior = prior
+            logger.debug(f"E-PUCT using log_prob={log_prob:.4f} -> prior={prior:.4f}")
         elif stats.log_prob_prior is not None:
             prior = stats.log_prob_prior
         else:
             prior = self.config.default_prior
+            logger.debug(f"E-PUCT using default prior={prior} (no log_prob available)")
 
         # Compute exploration bonus (PUCT-style)
         selection_count = stats.selection_count

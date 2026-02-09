@@ -5,7 +5,8 @@ OpenAI API interface for LLMs
 import asyncio
 import logging
 import time
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import openai
 
@@ -13,6 +14,27 @@ from openevolve.config import LLMConfig
 from openevolve.llm.base import LLMInterface
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class LLMResponse:
+    """Response from LLM including content and token usage"""
+    content: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    model: str = ""
+    log_prob: Optional[float] = None  # Average log probability of generated tokens
+
+    def to_token_usage(self):
+        """Convert to TokenUsage object (lazy import to avoid circular dependency)"""
+        from openevolve.token_tracker import TokenUsage
+        return TokenUsage(
+            prompt_tokens=self.prompt_tokens,
+            completion_tokens=self.completion_tokens,
+            total_tokens=self.total_tokens,
+            model=self.model,
+        )
 
 
 class OpenAILLM(LLMInterface):
@@ -169,4 +191,137 @@ class OpenAILLM(LLMInterface):
         logger = logging.getLogger(__name__)
         logger.debug(f"API parameters: {params}")
         logger.debug(f"API response: {response.choices[0].message.content}")
+
+        # Store last response for token usage extraction
+        self._last_response = response
         return response.choices[0].message.content
+
+    async def _call_api_with_usage(self, params: Dict[str, Any]) -> LLMResponse:
+        """Make the actual API call and return response with token usage"""
+        # Use asyncio to run the blocking API call in a thread pool
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None, lambda: self.client.chat.completions.create(**params)
+        )
+
+        # Extract token usage from response
+        usage = response.usage
+        prompt_tokens = usage.prompt_tokens if usage else 0
+        completion_tokens = usage.completion_tokens if usage else 0
+        total_tokens = usage.total_tokens if usage else 0
+
+        # Extract log probabilities if available
+        avg_log_prob = None
+        choice = response.choices[0]
+        if hasattr(choice, 'logprobs') and choice.logprobs is not None:
+            try:
+                # choice.logprobs.content is a list of token logprobs
+                token_logprobs = choice.logprobs.content
+                if token_logprobs and len(token_logprobs) > 0:
+                    # Calculate average log probability across all tokens
+                    log_probs = [t.logprob for t in token_logprobs if t.logprob is not None]
+                    if log_probs:
+                        avg_log_prob = sum(log_probs) / len(log_probs)
+                        logger.debug(f"Average log_prob: {avg_log_prob:.4f} (from {len(log_probs)} tokens)")
+            except Exception as e:
+                logger.debug(f"Could not extract logprobs: {e}")
+
+        logger.debug(
+            f"API response tokens: prompt={prompt_tokens}, "
+            f"completion={completion_tokens}, total={total_tokens}"
+        )
+
+        return LLMResponse(
+            content=response.choices[0].message.content,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+            model=self.model,
+            log_prob=avg_log_prob,
+        )
+
+    async def generate_with_usage(self, prompt: str, **kwargs) -> LLMResponse:
+        """Generate text from a prompt, returning token usage information"""
+        return await self.generate_with_context_and_usage(
+            system_message=self.system_message,
+            messages=[{"role": "user", "content": prompt}],
+            **kwargs,
+        )
+
+    async def generate_with_context_and_usage(
+        self, system_message: str, messages: List[Dict[str, str]], **kwargs
+    ) -> LLMResponse:
+        """Generate text using a system message and conversational context, with token usage"""
+        # Prepare messages with system message
+        formatted_messages = [{"role": "system", "content": system_message}]
+        formatted_messages.extend(messages)
+
+        # Set up generation parameters (same logic as generate_with_context)
+        OPENAI_REASONING_MODEL_PREFIXES = (
+            "o1-", "o1", "o3-", "o3", "o4-",
+            "gpt-5-", "gpt-5",
+            "gpt-oss-120b", "gpt-oss-20b",
+        )
+
+        model_lower = str(self.model).lower()
+        is_openai_reasoning_model = model_lower.startswith(OPENAI_REASONING_MODEL_PREFIXES)
+
+        if is_openai_reasoning_model:
+            params = {
+                "model": self.model,
+                "messages": formatted_messages,
+                "max_completion_tokens": kwargs.get("max_tokens", self.max_tokens),
+            }
+            reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
+            if reasoning_effort is not None:
+                params["reasoning_effort"] = reasoning_effort
+            if "verbosity" in kwargs:
+                params["verbosity"] = kwargs["verbosity"]
+        else:
+            params = {
+                "model": self.model,
+                "messages": formatted_messages,
+                "temperature": kwargs.get("temperature", self.temperature),
+                "top_p": kwargs.get("top_p", self.top_p),
+                "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+                "logprobs": True,  # Request log probabilities for E-PUCT prior
+            }
+            reasoning_effort = kwargs.get("reasoning_effort", self.reasoning_effort)
+            if reasoning_effort is not None:
+                params["reasoning_effort"] = reasoning_effort
+
+        # Add seed parameter
+        seed = kwargs.get("seed", self.random_seed)
+        if seed is not None:
+            if self.api_base == "https://generativelanguage.googleapis.com/v1beta/openai/":
+                pass  # Skip seed for Google AI Studio
+            else:
+                params["seed"] = seed
+
+        # Attempt the API call with retries
+        retries = kwargs.get("retries", self.retries)
+        retry_delay = kwargs.get("retry_delay", self.retry_delay)
+        timeout = kwargs.get("timeout", self.timeout)
+
+        for attempt in range(retries + 1):
+            try:
+                response = await asyncio.wait_for(
+                    self._call_api_with_usage(params), timeout=timeout
+                )
+                return response
+            except asyncio.TimeoutError:
+                if attempt < retries:
+                    logger.warning(f"Timeout on attempt {attempt + 1}/{retries + 1}. Retrying...")
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error(f"All {retries + 1} attempts failed with timeout")
+                    raise
+            except Exception as e:
+                if attempt < retries:
+                    logger.warning(
+                        f"Error on attempt {attempt + 1}/{retries + 1}: {str(e)}. Retrying..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error(f"All {retries + 1} attempts failed with error: {str(e)}")
+                    raise
